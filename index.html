@@ -1885,15 +1885,15 @@ let users = loadJSON("hitra_users", [
 
 let jobs = loadJSON("hitra_jobs", []);
 let masters = loadJSON("hitra_masters", {
-  customers:["ABC Customer","XYZ Logistics"],
+  customers:["",""],
   uoms:["PCS","BOX","PALLET"],
-  csrs:["csr01"],
+  csrs:[""],
   dg:["DG","Non-DG"],
   dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
   statuses:["Pending","Running","Complete"],
   vas:["Labelling","Repacking","None"],
   vehicles:["Truck","Trailer","Van"],
-  tallies:["Tally 01","Tally 02"],
+  tallies:["",""],
   docks:["Dock 1","Dock 2","Dock 3"]
 });
 let supervisorData = loadJSON("hitra_supervisor", []);
@@ -1905,10 +1905,10 @@ let editingEmployeeId = null;
 
 function normalizeMasters(){
   const defaults = {
-    customers:["ABC Customer","XYZ Logistics"], uoms:["PCS","BOX","PALLET"],
-    csrs:["csr01"], dg:["DG","Non-DG"], dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
+    customers:["",""], uoms:["PCS","BOX","PALLET"],
+    csrs:[""], dg:["DG","Non-DG"], dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
     statuses:["Pending","Running","Complete"], vas:["Labelling","Repacking","None"],
-    vehicles:["Truck","Trailer","Van"], tallies:["Tally 01","Tally 02"],
+    vehicles:["Truck","Trailer","Van"], tallies:["",""],
     docks:["Dock 1","Dock 2","Dock 3"]
   };
 
