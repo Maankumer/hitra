@@ -268,6 +268,12 @@ th{background:#eef1ff;color:#40506b;font-size:12px;padding:11px;text-align:left;
   .custom-dashboard-board:fullscreen>.custom-chart-grid>.custom-chart-card:nth-child(4),
   .custom-dashboard-board:fullscreen>.custom-chart-grid>.custom-chart-card:nth-child(5){grid-column:span 1}
 }
+
+/* HITRA cloud indicator: hide transient state messages on every page. */
+#cloudStatus{display:none !important;position:fixed;right:18px;bottom:18px;z-index:9999;border:1px solid #dce1ff;border-radius:999px;padding:8px 13px;background:rgba(255,255,255,.96);font-size:11px;font-weight:800;box-shadow:0 6px 18px rgba(7,17,38,.10);color:#16866e}
+#cloudStatus.online{display:block !important;color:#16866e;background:#e8faf5}
+#cloudStatus.offline{display:none !important}
+
 </style>
 <style>
 /* =========================================================
@@ -1853,6 +1859,12 @@ th{background:#eef1ff;color:#40506b}
 </div>
 
 
+
+<style id="hitra-fix-toast-style">
+#hitraToast{position:fixed;z-index:999999;right:18px;bottom:22px;max-width:min(420px,calc(100vw - 36px));padding:13px 18px;border-radius:14px;background:#172554;color:#fff;box-shadow:0 12px 35px #0f172a30;font:600 14px/1.45 system-ui,sans-serif;opacity:0;transform:translateY(12px);pointer-events:none;transition:opacity .22s,transform .22s}#hitraToast.show{opacity:1;transform:translateY(0)}#hitraToast.success{background:#087f68}#hitraToast.error{background:#b42318}
+</style>
+<div id="hitraToast" role="status" aria-live="polite"></div>
+
 <script>
 "use strict";
 
@@ -1885,15 +1897,15 @@ let users = loadJSON("hitra_users", [
 
 let jobs = loadJSON("hitra_jobs", []);
 let masters = loadJSON("hitra_masters", {
-  customers:["",""],
+  customers:["ABC Customer","XYZ Logistics"],
   uoms:["PCS","BOX","PALLET"],
-  csrs:[""],
+  csrs:["csr01"],
   dg:["DG","Non-DG"],
   dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
   statuses:["Pending","Running","Complete"],
   vas:["Labelling","Repacking","None"],
   vehicles:["Truck","Trailer","Van"],
-  tallies:["",""],
+  tallies:["Tally 01","Tally 02"],
   docks:["Dock 1","Dock 2","Dock 3"]
 });
 let supervisorData = loadJSON("hitra_supervisor", []);
@@ -1905,10 +1917,10 @@ let editingEmployeeId = null;
 
 function normalizeMasters(){
   const defaults = {
-    customers:["",""], uoms:["PCS","BOX","PALLET"],
-    csrs:[""], dg:["DG","Non-DG"], dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
+    customers:["ABC Customer","XYZ Logistics"], uoms:["PCS","BOX","PALLET"],
+    csrs:["csr01"], dg:["DG","Non-DG"], dgclass:["Class 2","Class 3","Class 4","Class 8","Class 9"],
     statuses:["Pending","Running","Complete"], vas:["Labelling","Repacking","None"],
-    vehicles:["Truck","Trailer","Van"], tallies:["",""],
+    vehicles:["Truck","Trailer","Van"], tallies:["Tally 01","Tally 02"],
     docks:["Dock 1","Dock 2","Dock 3"]
   };
 
@@ -1943,14 +1955,25 @@ const firebaseConfig={
 };
 
 let cloudDb=null, cloudStateRef=null, cloudReady=false, cloudHydrated=false, cloudApplying=false, cloudWriting=false, cloudUnsubscribe=null;
+let cloudInitialSnapshotHandled=false;
+// Last server-confirmed snapshot used to calculate per-record changes. This prevents
+// concurrent CSR/Warehouse clients from overwriting each other with stale full arrays.
+let cloudBaseline=null;
+// Queue save requests so changes made during an active write are not silently skipped.
+let cloudWritePending=false, cloudWriteTimer=null, cloudRetryTimer=null, cloudRetryCount=0;
 
 function setCloudStatus(text,state){
   const box=el("cloudStatus");
   if(!box)return;
-  box.textContent=text;
   box.classList.remove("online","offline");
-  if(state==="online")box.classList.add("online");
-  if(state==="offline")box.classList.add("offline");
+  if(state==="online"){
+    box.textContent="☁ Cloud Connected";
+    box.classList.add("online");
+  }else{
+    // Connecting/saving/recovery/error messages are intentionally hidden.
+    // Actual sync continues in the background; do not flash status text.
+    box.textContent="";
+  }
 }
 
 function initFirebaseDirect(){
@@ -1994,19 +2017,152 @@ function cloudPayload(){
   return {users, jobs, masters, supervisorData, employees, overtimeData, updatedAt:firebase.firestore.FieldValue.serverTimestamp()};
 }
 
-function saveCloudState(){
-  if(!cloudDb||!cloudStateRef||!cloudReady||!cloudHydrated||cloudApplying||cloudWriting)return;
-  cloudWriting=true;
-  cloudStateRef.set(cloudPayload(),{merge:true})
-    .then(()=>setCloudStatus("☁ Cloud: Synced","online"))
-    .catch(error=>{
-      console.error("HITRA Firebase Save Error:",error);
-      setCloudStatus("☁ Cloud: "+(error.code||error.message||"Save Error"),"offline");
-    })
-    .finally(()=>{cloudWriting=false;});
+function jsonEqual(a,b){
+  try{return JSON.stringify(a)===JSON.stringify(b);}catch(e){return false;}
+}
+function cloneData(x){
+  try{return JSON.parse(JSON.stringify(x));}catch(e){return x;}
+}
+function entityKey(type,row,index){
+  if(type==="jobs")return String(row&&row.id!=null?row.id:"");
+  if(type==="users")return String(row&&row.username||"").toLowerCase();
+  if(type==="employees")return String(row&&row.id||"");
+  if(type==="supervisorData")return String(row&&(row.jobId||row.jobNumber)||"").toLowerCase();
+  if(type==="overtimeData")return String(row&&(row.id||row.employeeId+":"+row.month+":"+row.year)||index);
+  return String(index);
 }
 
-function hydrateFromCloud(data){
+// Merge only fields changed on this device against its last server baseline.
+// Firestore transaction serializes simultaneous saves from different devices.
+function mergeArrayChanges(baseRows, localRows, latestRows, type){
+  const base=Array.isArray(baseRows)?baseRows:[];
+  const local=Array.isArray(localRows)?localRows:[];
+  let latest=Array.isArray(latestRows)?latestRows.map(cloneData):[];
+  const baseMap=new Map(base.map((r,i)=>[entityKey(type,r,i),r]));
+  const localMap=new Map(local.map((r,i)=>[entityKey(type,r,i),r]));
+  const latestMap=()=>new Map(latest.map((r,i)=>[entityKey(type,r,i),i]));
+
+  // Explicit deletions made on this device only delete records that existed in its baseline.
+  for(const [key,oldRow] of baseMap){
+    if(!localMap.has(key)){
+      const ix=latestMap().get(key);
+      if(ix!==undefined)latest.splice(ix,1);
+    }
+  }
+  // New records and changed fields are applied to the freshest server version.
+  for(const [key,row] of localMap){
+    const old=baseMap.get(key);
+    let ix=latestMap().get(key);
+    if(!old){
+      if(ix===undefined)latest.push(cloneData(row));
+      else latest[ix]={...latest[ix],...cloneData(row)};
+      continue;
+    }
+    if(jsonEqual(old,row))continue;
+    const patch={};
+    const keys=new Set([...Object.keys(old||{}),...Object.keys(row||{})]);
+    keys.forEach(k=>{
+      if(!jsonEqual(old[k],row[k])){
+        if(Object.prototype.hasOwnProperty.call(row,k))patch[k]=cloneData(row[k]);
+        else patch[k]=undefined;
+      }
+    });
+    if(ix===undefined){latest.push(cloneData(row));}
+    else{
+      const merged={...latest[ix]};
+      Object.keys(patch).forEach(k=>{if(patch[k]===undefined)delete merged[k];else merged[k]=patch[k];});
+      latest[ix]=merged;
+    }
+  }
+  return latest;
+}
+
+function buildMergedCloudState(serverData){
+  const latest=serverData&&typeof serverData==="object"?serverData:{};
+  const base=cloudBaseline&&typeof cloudBaseline==="object"?cloudBaseline:{};
+  const local={users,jobs,masters,supervisorData,employees,overtimeData};
+  const out={...latest};
+  ["users","jobs","supervisorData","employees","overtimeData"].forEach(k=>{
+    out[k]=mergeArrayChanges(base[k]||[],local[k]||[],latest[k]||[],k);
+  });
+  // Masters are small shared dropdown lists; merge per master category instead of replacing
+  // the entire object, so concurrent changes to different master types are retained.
+  const bm=base.masters||{}, lm=local.masters||{}, sm=latest.masters||{};
+  const mergedMasters={...sm};
+  new Set([...Object.keys(bm),...Object.keys(lm)]).forEach(k=>{
+    if(!jsonEqual(bm[k],lm[k]))mergedMasters[k]=cloneData(lm[k]);
+  });
+  out.masters=mergedMasters;
+  return out;
+}
+
+function saveCloudState(){
+  if(!cloudDb||!cloudStateRef)return;
+  if(!cloudReady||!cloudHydrated||cloudApplying)return;
+  cloudWritePending=true;
+  try{localStorage.setItem("hitra_cloud_pending","1");}catch(e){}
+  if(cloudWriteTimer)clearTimeout(cloudWriteTimer);
+  cloudWriteTimer=setTimeout(()=>{cloudWriteTimer=null;flushCloudWriteQueue();},180);
+}
+
+async function flushCloudWriteQueue(){
+  if(!cloudWritePending||cloudWriting)return;
+  if(!cloudDb||!cloudStateRef||!cloudReady||!cloudHydrated||cloudApplying)return;
+  if(cloudRetryTimer){clearTimeout(cloudRetryTimer);cloudRetryTimer=null;}
+  cloudWritePending=false;
+  cloudWriting=true;
+  try{
+    await cloudDb.runTransaction(async transaction=>{
+      const snap=await transaction.get(cloudStateRef);
+      const serverData=snap.exists?(snap.data()||{}):{};
+      const merged=buildMergedCloudState(serverData);
+      merged.updatedAt=firebase.firestore.FieldValue.serverTimestamp();
+      transaction.set(cloudStateRef,merged,{merge:true});
+      return merged;
+    }).then(merged=>{
+      // The transaction has committed. Save the committed baseline; later local edits
+      // remain pending and will be flushed in a second transaction.
+      cloudBaseline=cloneData(merged);
+    });
+    cloudRetryCount=0;
+    if(!cloudWritePending){try{localStorage.removeItem("hitra_cloud_pending");}catch(e){}}
+    setCloudStatus("☁ Cloud Connected","online");
+  }catch(error){
+    console.error("HITRA Firebase transactional save error:",error);
+    cloudWritePending=true;
+    const code=String(error&&error.code||"");
+    const retryable=["unavailable","deadline-exceeded","aborted","resource-exhausted","cancelled","internal","unknown"].some(part=>code.includes(part));
+    if(retryable&&cloudRetryCount<8){
+      cloudRetryCount++;
+      const delay=Math.min(60000,700*Math.pow(2,cloudRetryCount-1));
+      cloudRetryTimer=setTimeout(()=>{cloudRetryTimer=null;flushCloudWriteQueue();},delay);
+    }else{
+      console.error("HITRA cloud save remains pending. Local backup retained.");
+    }
+  }finally{
+    cloudWriting=false;
+    if(cloudWritePending&&!cloudRetryTimer){
+      if(cloudWriteTimer)clearTimeout(cloudWriteTimer);
+      cloudWriteTimer=setTimeout(()=>{cloudWriteTimer=null;flushCloudWriteQueue();},250);
+    }
+  }
+}
+
+function cloudPayloadMatchesLocal(data){
+  if(!data || typeof data!=="object")return false;
+  const local={users, jobs, masters, supervisorData, employees, overtimeData};
+  const keys=Object.keys(local);
+  try{
+    return keys.every(key=>JSON.stringify(data[key]===undefined?(key==="masters"?{}:[]):data[key])===JSON.stringify(local[key]));
+  }catch(e){return false;}
+}
+
+function hasPendingCloudSave(){
+  try{return localStorage.getItem("hitra_cloud_pending")==="1";}catch(e){return false;}
+}
+
+function hydrateFromCloud(data,preserveCurrentView){
+  cloudBaseline=cloneData(data||{});
   cloudApplying=true;
   try{
     if(Array.isArray(data.users))users=data.users;
@@ -2017,12 +2173,15 @@ function hydrateFromCloud(data){
     if(Array.isArray(data.overtimeData))overtimeData=data.overtimeData;
     localBackup();
     loadUI();
-    clearOffice();
+    // Initial load can clear the empty entry form. Background cloud updates must
+    // never throw the user out of the current page or clear a form in progress.
+    if(!preserveCurrentView)clearOffice();
     renderAll();
     renderSupervisor();
     renderManager();
     renderEmployees();
     renderOvertime();
+    if(!preserveCurrentView)restoreSession();
   }catch(error){
     console.error("HITRA Firebase cloud data error:",error);
   }finally{cloudApplying=false;}
@@ -2031,25 +2190,77 @@ function hydrateFromCloud(data){
 function startCloudSync(){
   if(!initFirebaseDirect())return;
   if(cloudUnsubscribe){try{cloudUnsubscribe();}catch(e){}}
-  cloudUnsubscribe=cloudStateRef.onSnapshot(snapshot=>{
+  cloudInitialSnapshotHandled=false;
+  cloudUnsubscribe=cloudStateRef.onSnapshot({includeMetadataChanges:true},snapshot=>{
     cloudReady=true;
-    cloudHydrated=true;
-    if(!snapshot.exists){
+
+    // Ignore Firestore's local-write echo. Waiting for the server-confirmed
+    // snapshot prevents the old pending marker from re-queuing itself forever.
+    if(snapshot.metadata && snapshot.metadata.hasPendingWrites)return;
+
+    const data=snapshot.exists?(snapshot.data()||{}):{};
+    if(!cloudInitialSnapshotHandled){
+      cloudInitialSnapshotHandled=true;
+      cloudHydrated=true;
+      cloudBaseline=cloneData(data||{});
+
+      // A previous tab may have closed during a write. Keep this device's
+      // recovery copy and resend it once the cloud listener is ready.
+      if(hasPendingCloudSave()){
+        saveCloudState();
+        return;
+      }
+      if(!snapshot.exists){
+        saveCloudState();
+        return;
+      }
       setCloudStatus("☁ Cloud: Connected","online");
+      hydrateFromCloud(data,false);
+      return;
+    }
+
+    cloudHydrated=true;
+
+    // Do not apply snapshot echoes or overwrite a newer unsynced local edit.
+    if(cloudWriting || cloudWritePending || hasPendingCloudSave()){
+      if(snapshot.exists && cloudPayloadMatchesLocal(data))setCloudStatus("☁ Cloud: Connected","online");
+      return;
+    }
+
+    if(!snapshot.exists){
       saveCloudState();
       return;
     }
+
     setCloudStatus("☁ Cloud: Connected","online");
-    hydrateFromCloud(snapshot.data()||{});
+    // A remote update should refresh data but preserve the current role/page,
+    // selected tab and the contents of any in-progress entry form.
+    if(!cloudPayloadMatchesLocal(data))hydrateFromCloud(data,true);
+    else cloudBaseline=cloneData(data);
   },error=>{
     cloudReady=false;
     console.error("HITRA Firestore listener error:",error);
-    setCloudStatus("☁ Cloud: "+(error.code||error.message||"Connection Error"),"offline");
+    // Error/status chip stays hidden; sync queue and local backup are retained.
   });
 }
 
-
 function el(id){ return document.getElementById(id); }
+
+let hitraToastTimer=null;
+function showToast(message,type){
+  const node=document.getElementById("hitraToast");
+  if(!node){console.info(message);return;}
+  node.textContent=String(message||"");node.className="show "+(type||"");
+  if(hitraToastTimer)clearTimeout(hitraToastTimer);
+  hitraToastTimer=setTimeout(()=>{node.className="";},3200);
+}
+
+// Replace blocking OK-style alerts throughout every role/page with a short toast.
+function notifyAlert(message){
+  const text=String(message==null?"":message);
+  const success=/success|saved|sent|added|updated|created|moved to/i.test(text);
+  showToast(text,success?"success":"error");
+}
 
 function val(id){
   const e=el(id);
@@ -2085,58 +2296,42 @@ function setOpts(id, arr, all){
     e.value="";
 }
 
-function login(){
-
-  const u=val("loginUser"),
-        p=el("loginPass")?el("loginPass").value:"",
-        r=val("loginRole");
-
-  const found=users.find(x=>
-    String(x.username)===u &&
-    String(x.password)===p &&
-    String(x.role)===r
-  );
-
-  if(!found){
-    el("loginError").textContent="Wrong Login ID, Password or Role.";
-    return;
-  }
-
-  el("loginError").textContent="";
+function showUserDashboard(found){
+  if(!found)return false;
   currentUser=found;
-
+  try{localStorage.setItem("hitra_session",JSON.stringify({username:found.username,role:found.role}));}catch(e){}
   el("loginPage").classList.add("hidden");
   el("appHeader").classList.remove("hidden");
-
-  el("loggedUser").textContent=
-    found.username+" • "+String(found.role).toUpperCase();
-
+  el("loggedUser").textContent=found.username+" • "+String(found.role).toUpperCase();
   hidePages();
-
-  if(r==="csr"){
-    el("csrPage").classList.add("active");
-    loadUI();
-    clearOffice();
-    renderAll();
-
-  }else if(r==="warehouse"){
-
-    el("warehousePage").classList.add("active");
-    closeWarehouseMobileEntry();
-    renderWarehouse();
-
-  }else if(r==="supervisor"){
-
+  if(found.role==="csr"){
+    el("csrPage").classList.add("active");loadUI();clearOffice();renderAll();
+  }else if(found.role==="warehouse"){
+    el("warehousePage").classList.add("active");closeWarehouseMobileEntry();renderWarehouse();
+  }else if(found.role==="supervisor"){
     el("supervisorPage").classList.add("active");
     const generalBtn=el("supervisorPage").querySelector(".supervisor-tab");
-    showSupervisorSection("general",generalBtn);
-    renderSupervisor();
-
+    showSupervisorSection("general",generalBtn);renderSupervisor();
   }else{
-
-    el("managerPage").classList.add("active");
-    renderManager();
+    el("managerPage").classList.add("active");renderManager();
   }
+  return true;
+}
+function restoreSession(){
+  try{
+    const saved=JSON.parse(localStorage.getItem("hitra_session")||"null");
+    if(!saved||!saved.username||!saved.role)return;
+    const found=users.find(x=>String(x.username)===String(saved.username)&&String(x.role)===String(saved.role));
+    if(found)showUserDashboard(found);
+    else localStorage.removeItem("hitra_session");
+  }catch(e){console.warn("HITRA session restore skipped",e);}
+}
+function login(){
+  const u=val("loginUser"), p=el("loginPass")?el("loginPass").value:"", r=val("loginRole");
+  const found=users.find(x=>String(x.username)===u&&String(x.password)===p&&String(x.role)===r);
+  if(!found){el("loginError").textContent="Wrong Login ID, Password or Role.";return;}
+  el("loginError").textContent="";
+  showUserDashboard(found);
 }
 
 function hidePages(){
@@ -2146,6 +2341,7 @@ function hidePages(){
 
 function logout(){
 
+  try{localStorage.removeItem("hitra_session");}catch(e){}
   stopManagerVoice();
   closeManagerAssistant();
   currentUser=null;
@@ -2169,12 +2365,12 @@ function createUser(){
         r=val("newRole");
 
   if(!u||!p)
-    return alert("Enter Login ID and Password");
+    return notifyAlert("Enter Login ID and Password");
 
   if(users.some(x=>
     String(x.username).toLowerCase()===u.toLowerCase()
   ))
-    return alert("Login ID already exists");
+    return notifyAlert("Login ID already exists");
 
   users.push({
     username:u,
@@ -2188,7 +2384,7 @@ function createUser(){
   el("newUser").value="";
   el("newPass").value="";
 
-  alert("User created successfully");
+  showToast("User created successfully","success");
 }
 
 function renderUsers(){
@@ -2388,11 +2584,11 @@ function addMasters(){
     loadUI();
     renderMasters();
 
-    alert(added+" master value(s) added successfully");
+    showToast(added+" master value(s) added successfully","success");
 
   }else{
 
-    alert("Enter at least one new master value");
+    notifyAlert("Enter at least one new master value");
   }
 }
 
@@ -2562,10 +2758,10 @@ function saveOffice(action){
   const d=entryData();
 
   if(!d.jobNumber||!d.customer)
-    return alert("Job Number and Customer are required");
+    return notifyAlert("Job Number and Customer are required");
 
   if(d.dg==="DG"&&!d.dgClass)
-    return alert("Please select a DG Class");
+    return notifyAlert("Please select a DG Class");
 
   if(editingId){
 
@@ -2574,7 +2770,7 @@ function saveOffice(action){
     );
 
     if(i<0)
-      return alert("Entry not found");
+      return notifyAlert("Entry not found");
 
     const old=jobs[i];
 
@@ -2614,7 +2810,7 @@ function saveOffice(action){
 
   db();
 
-  alert(
+  notifyAlert(
     action==="Sent"
     ?"Job sent to Warehouse and Supervisor"
     :"Entry saved successfully"
@@ -2631,7 +2827,7 @@ function editOffice(encodedId){
         j=jobs.find(x=>String(x.id)===String(id));
 
   if(!j)
-    return alert("Entry not found");
+    return notifyAlert("Entry not found");
 
   editingId=j.id;
 
@@ -2680,7 +2876,7 @@ function deleteOffice(encodedId){
         j=jobs.find(x=>String(x.id)===String(id));
 
   if(!j)
-    return alert("Entry not found");
+    return notifyAlert("Entry not found");
 
   if(confirm("Delete job "+(j.jobNumber||id)+"?")){
 
@@ -3419,7 +3615,7 @@ function closeWarehouseMobileEntry(){
 function warehouseMobileAction(encodedId, action){
   const id = decodeArg(encodedId);
   const j = jobs.find(x => String(x.id) === String(id));
-  if(!j) return alert('Job not found');
+  if(!j) return notifyAlert('Job not found');
 
   ['tally','approved','arrival','report','dispatch','label'].forEach(name => {
     const src = el('wm_'+name+'_'+j.id);
@@ -3438,7 +3634,7 @@ function warehouseUpdate(encodedId,action){
         );
 
   if(!j)
-    return alert("Job not found");
+    return notifyAlert("Job not found");
 
   const get=k=>
     el(k+"_"+j.id)
@@ -3468,10 +3664,11 @@ function warehouseUpdate(encodedId,action){
 
   db();
 
-  alert(
+  showToast(
     action==="post"
     ?"Posted to Office. Job removed from Warehouse working list."
-    :"Warehouse data saved successfully"
+    :"Warehouse data saved successfully",
+    "success"
   );
 
   renderWarehouse();
@@ -3613,7 +3810,7 @@ function saveSupervisor(encodedId){
         );
 
   if(!j)
-    return alert("Job not found");
+    return notifyAlert("Job not found");
 
   const row={
     jobId:j.id,
@@ -3660,7 +3857,7 @@ function saveSupervisor(encodedId){
   renderSupervisor();
   renderManager();
 
-  alert(
+  notifyAlert(
     "Supervisor entry saved. It moved to Saved / Excel Data."
   );
 }
@@ -3670,7 +3867,7 @@ function editSupervisorSaved(index){
   const x=supervisorData[index];
 
   if(!x)
-    return alert("Saved entry not found");
+    return notifyAlert("Saved entry not found");
 
   el("seJob").value=x.jobNumber||"";
   el("seType").value=x.type||"";
@@ -3723,7 +3920,7 @@ function saveSupervisorEdit(){
     !Number.isInteger(index)||
     !supervisorData[index]
   )
-    return alert("Saved entry not found");
+    return notifyAlert("Saved entry not found");
 
   const x=supervisorData[index];
 
@@ -3757,7 +3954,7 @@ function saveSupervisorEdit(){
   renderAll();
   renderManager();
 
-  alert(
+  notifyAlert(
     "Supervisor entry updated successfully."
   );
 }
@@ -3775,7 +3972,7 @@ function saveEmployee(){
         pay=Number(val("empPay"))||0;
 
   if(!name||!post)
-    return alert(
+    return notifyAlert(
       "Employee Name and Employee Post are required"
     );
 
@@ -3786,7 +3983,7 @@ function saveEmployee(){
     );
 
     if(i<0)
-      return alert("Employee not found");
+      return notifyAlert("Employee not found");
 
     employees[i]={
       ...employees[i],
@@ -3803,7 +4000,7 @@ function saveEmployee(){
         name.toLowerCase()
       )
     )
-      return alert("Employee already exists");
+      return notifyAlert("Employee already exists");
 
     employees.push({
       id:employeeId(),
@@ -3819,7 +4016,7 @@ function saveEmployee(){
   renderEmployees();
   renderOvertime();
 
-  alert("Employee saved successfully");
+  showToast("Employee saved successfully","success");
 }
 
 function clearEmployee(){
@@ -4091,14 +4288,14 @@ function saveOvertime(){
         off=val("otOff");
 
   if(!date||!eid||!start||!off)
-    return alert(
+    return notifyAlert(
       "Date, Employee, Start Time and Off Time are required"
     );
 
   const emp=employeeById(eid);
 
   if(!emp)
-    return alert("Select a valid employee");
+    return notifyAlert("Select a valid employee");
 
   const h=
     Number(val("otHours"))||0;
@@ -4150,7 +4347,7 @@ function saveOvertime(){
   clearOvertime();
   renderOvertime();
 
-  alert("Overtime saved successfully");
+  showToast("Overtime saved successfully","success");
 }
 
 function renderOvertime(){
@@ -4306,7 +4503,7 @@ function saveOvertimeEdit(){
     !Number.isInteger(index)||
     !overtimeData[index]
   )
-    return alert(
+    return notifyAlert(
       "Overtime entry not found"
     );
 
@@ -4314,7 +4511,7 @@ function saveOvertimeEdit(){
         emp=employeeById(eid);
 
   if(!emp)
-    return alert(
+    return notifyAlert(
       "Select a valid employee"
     );
 
@@ -4350,7 +4547,7 @@ function saveOvertimeEdit(){
   closeOvertimeEdit();
   renderOvertime();
 
-  alert(
+  notifyAlert(
     "Overtime updated successfully"
   );
 }
@@ -4826,9 +5023,9 @@ function addMasters(){
     db();
     loadUI();
     renderMasters();
-    alert(added+" master value(s) added successfully");
+    showToast(added+" master value(s) added successfully","success");
   }else{
-    alert("Enter at least one new master value");
+    notifyAlert("Enter at least one new master value");
   }
 }
 
@@ -6170,6 +6367,7 @@ if(el("customDashboardFile"))el("customDashboardFile").addEventListener("change"
 ========================================================= */
 
 startCloudSync();
+restoreSession();
 db();
 // Normalize only the in-memory interpretation; original cloud fields stay untouched.
 if(Array.isArray(jobs))jobs.forEach(j=>{if(j && typeof j==="object" && !j.dg && j.dgClass){j._hitraDgDerived="DG";}});
@@ -6180,7 +6378,9 @@ renderSupervisor();
 renderManager();
 renderEmployees();
 renderOvertime();
-window.addEventListener("beforeunload",()=>{try{localBackup();}catch(e){}});
+window.addEventListener("beforeunload",()=>{try{localBackup();if(cloudWritePending||cloudWriting){localStorage.setItem("hitra_cloud_pending","1");}}catch(e){}});
+window.addEventListener("online",()=>{if(cloudWritePending)flushCloudWriteQueue();});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"){try{localBackup();if(cloudWritePending&&!cloudWriting)flushCloudWriteQueue();}catch(e){}}});
 
 </script>
 
